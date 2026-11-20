@@ -8,7 +8,7 @@ RADET files may be .xlsx or .csv. No names or hospital numbers are read.
 """
 import sys, os, warnings, numpy as np, pandas as pd
 warnings.filterwarnings("ignore")
-from lifelines import KaplanMeierFitter, CoxPHFitter
+from lifelines import KaplanMeierFitter, CoxPHFitter, AalenJohansenFitter
 from lifelines.statistics import proportional_hazard_test
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
@@ -141,6 +141,7 @@ def outcomes(x, v, grace=GRACE, duecol="due", close=CLOSE, t0=T0, censor_invalid
     r["ret"] = np.where(r.ret.eq(1) & (r.retdate <= rend), 1, 0)
     r["rt"] = (np.where(r.ret == 1, r.retdate, rend).astype("datetime64[ns]") - r.evdate.values).astype("timedelta64[D]").astype(float)
     r["rt"] = r.rt.clip(lower=0.5)
+    r["rcode"] = np.where(r.ret == 1, 1, np.where(r.rexit != "none", 2, 0))   # 1 returned, 2 competing event, 0 still without a pickup at data extraction
     return y, r
 
 x = derive(x); y, r = outcomes(x, v)
@@ -162,6 +163,15 @@ def km_at(df, tcol, ecol, times):
         s = float(k.predict(tt)); ci = k.confidence_interval_.loc[:tt].iloc[-1]
         out.append((100 * (1 - s), 100 * (1 - ci.iloc[1]), 100 * (1 - ci.iloc[0])))
     return out
+def cif_at(df, times):
+    """Cumulative incidence of return, with death, transfer out, stopping of treatment and closure of a record as competing events."""
+    np.random.seed(1)
+    aj = AalenJohansenFitter(calculate_variance=True).fit(df.rt, df.rcode, event_of_interest=1)
+    cd = aj.cumulative_density_.iloc[:, 0]; ci = aj.confidence_interval_; out = []
+    for tt in times:
+        out.append((100 * float(cd.loc[:tt].iloc[-1]), 100 * float(ci.loc[:tt].iloc[-1, 0]), 100 * float(ci.loc[:tt].iloc[-1, 1])))
+    half = cd[cd >= 0.5]
+    return out, (float(half.index[0]) if len(half) else np.nan)
 rows = []
 for col, lab in VARS:
     for lev, g in y.groupby(col, observed=True):
@@ -207,10 +217,11 @@ log("\nRETURN TO CARE after first interruption: episodes", len(r), " returned", 
 rr = []
 r = r.merge(y[["pid", "vergrp"]], on="pid")
 log("Returned, crude: %.1f%%; outcome of those not returned: %s" % (100 * r.ret.mean(), r[r.ret == 0].rexit.value_counts().to_dict()))
+log("Kaplan-Meier (competing events censored) for comparison, 28/90/180 days:", [round(q[0], 1) for q in km_at(r, "rt", "ret", [28, 90, 180])])
 log("Days from supply end to return, median:", (r[r.ret == 1].rt + GRACE).median())
 for lab, g in [("All", r)] + [(k, g) for k, g in r.groupby("kp")] + [("Earlier late returns " + str(k), g) for k, g in r.groupby("prior", observed=True)]:
-    e = km_at(g, "rt", "ret", [28, 90, 180, 365]); k = KaplanMeierFitter().fit(g.rt, g.ret)
-    rr.append([lab, len(g), int(g.ret.sum())] + [round(z, 1) for q in e for z in q] + [k.median_survival_time_])
+    e, med = cif_at(g, [28, 90, 180, 365])
+    rr.append([lab, len(g), int(g.ret.sum())] + [round(z, 1) for q in e for z in q] + [round(med)])
 T3 = pd.DataFrame(rr, columns=["Group", "Episodes", "Returned", "28d %", "lo", "hi", "90d %", "lo", "hi", "180d %", "lo", "hi", "365d %", "lo", "hi", "Median days"])
 T3.to_excel(xw, "Table 3 return", index=False); log(T3.to_string(index=False))
 mR, sR, _ = cox(r, "rt", "ret", TERMS, REFS, label="return adjusted"); sR.to_excel(xw, "Cox return", index=False)
@@ -236,9 +247,18 @@ wb = v[v.pid.isin(y.pid)].copy(); wb["riskday"] = wb.due + days(GRACE); wb = wb[
 wb["missed"] = (wb.nextdate > wb.riskday).astype(int); wb["month"] = wb.due.dt.to_period("M")
 mb = wb.groupby("month").missed.agg(["size", "sum"]); mb["pct"] = 100 * mb["sum"] / mb["size"]; mb = mb[mb.index <= "2024-02"]
 mb.to_excel(xw, "Monthly before baseline"); log("\nBEFORE BASELINE, same clients: intervals by month supply ran out (all returned, by definition of the cohort)\n" + mb.round(1).to_string())
-w["fac"] = w.pid.map(y.set_index("pid").fac); w["per"] = np.where(w.due < "2024-07-01", "A", "B")
-cp = w[w.due < "2025-01-01"].groupby(["fac", "per"]).missed.mean().unstack() * 100
-log("Clinics where the percentage missed was higher in April to June 2024 than in July to December 2024: %d of %d" % ((cp.A > cp.B).sum(), len(cp)))
+w["fac"] = w.pid.map(y.set_index("pid").fac)
+wf = w[w.due >= T0].copy(); wf["per3"] = np.where(wf.due < "2024-07-01", "Apr-Jun 2024", np.where(wf.due < PAUSE, "Jul 2024-23 Jan 2025", "24 Jan 2025 onward"))
+cp = wf.groupby(["fac", "per3"]).missed.mean().unstack() * 100
+log("Clinics where the percentage missed in April to June 2024 was higher than in July 2024 to 23 January 2025: %d of %d; higher than from 24 January 2025: %d of %d" % ((cp["Apr-Jun 2024"] > cp["Jul 2024-23 Jan 2025"]).sum(), len(cp), (cp["Apr-Jun 2024"] > cp["24 Jan 2025 onward"]).sum(), len(cp)))
+log("Clinic range of percentage missed: April to June 2024 %.1f to %.1f; July 2024 to 23 January 2025 %.1f to %.1f; from 24 January 2025 %.1f to %.1f" % (cp["Apr-Jun 2024"].min(), cp["Apr-Jun 2024"].max(), cp["Jul 2024-23 Jan 2025"].min(), cp["Jul 2024-23 Jan 2025"].max(), cp["24 Jan 2025 onward"].min(), cp["24 Jan 2025 onward"].max()))
+wb["fac"] = wb.pid.map(y.set_index("pid").fac); pk = wb[(wb.due >= "2023-09-01") & (wb.due < "2023-11-01")].groupby("fac").missed.mean() * 100
+log("Before baseline, September to October 2023, percentage of intervals with a late return by clinic: range %.1f to %.1f; clinics above 50%%: %d of %d" % (pk.min(), pk.max(), (pk > 50).sum(), len(pk)))
+for lab_, a_, b_ in [("September to October 2023", "2023-09-01", "2023-11-01"), ("January to July 2023", "2023-01-01", "2023-08-01")]:
+    q = wb[(wb.due >= a_) & (wb.due < b_)]; dl = (q.nextdate - q.due).dt.days
+    log("Days from supply end to next pickup, intervals ending %s: n %d; 10th, 25th, 50th, 75th, 90th percentile %s; supply of 150 days or more %.1f%%" % (lab_, len(q), dl.quantile([.1, .25, .5, .75, .9]).round(0).tolist(), 100 * (q.rf >= 150).mean()))
+q = wf[(wf.per3 == "Apr-Jun 2024") & wf.nextdate.notna()]; dl = (q.nextdate - q.due).dt.days
+log("Days from supply end to next pickup, intervals ending April to June 2024 with a later pickup: n %d; percentiles %s" % (len(q), dl.quantile([.1, .25, .5, .75, .9]).round(0).tolist()))
 mo.to_excel(xw, "Monthly intervals"); log("\nDISPENSING INTERVALS by month supply ran out\n" + mo.round(1).to_string())
 pre = w[(w.due >= "2024-04-01") & (w.due < PAUSE)]; post = w[(w.due >= PAUSE) & (w.due <= "2026-02-28")]
 log("Intervals ending before pause: %d, missed %.2f%%; on or after: %d, missed %.2f%%" % (len(pre), 100 * pre.missed.mean(), len(post), 100 * post.missed.mean()))
@@ -248,7 +268,7 @@ log("Interruptions per client in follow-up:", w.groupby("pid").missed.sum().rein
 sens = []
 def summ(lab, yy, rr_):
     k = km_at(yy, "t", "event", [365, 730]); _, s, _ = cox(yy, "t", "event", TERMS, REFS, label=lab)
-    g = s.set_index("term"); e = km_at(rr_, "rt", "ret", [90])[0] if len(rr_) else (np.nan,) * 3
+    g = s.set_index("term"); e = cif_at(rr_, [90])[0][0] if len(rr_) else (np.nan,) * 3
     sens.append([lab, len(yy), int(yy.event.sum()), round(k[0][0], 1), round(k[1][0], 1)] +
                 [f"{g.loc[t,'HR']:.2f} ({g.loc[t,'lo']:.2f}-{g.loc[t,'hi']:.2f})" for t in ["prior=1", "prior=2", "prior=3+", "kpsex=MSM", "kpsex=PWID, male", "kpsex=PWID, female", "kpsex=TRANSGENDER"]] + [round(e[0], 1)])
 summ("Main analysis", y, r)
@@ -262,6 +282,7 @@ T0B = pd.Timestamp("2024-07-01"); xb, _, _ = build(T0B); xb = derive(xb, T0B); y
 log("July 2024 start: person-years %d, rate per 100 py %.1f" % (y7.t.sum() / 365.25, 100 * y7.event.sum() / (y7.t.sum() / 365.25)))
 y6 = y[y.n_int >= 2]; summ("At least two earlier dispensing intervals", y6, r[r.pid.isin(y6.pid)])
 y9, r9 = outcomes(x, v, censor_invalid=False); summ("Records judged invalid during follow-up not censored", y9, r9)
+y13, r13 = outcomes(x, v, grace=90, censor_invalid=False); summ("More than 90 days without medicine, records judged invalid not censored", y13, r13)
 log("Not censored: returned crude %.1f%%; not returned by line-list status: %s" % (100 * r9.ret.mean(), r9[r9.ret == 0].status.value_counts(dropna=False).to_dict()))
 log("Not censored: first interruptions among records judged invalid during follow-up: %d of %d" % (y9[y9.invdate >= T0].event.sum(), (y9.invdate >= T0).sum()))
 y10 = y[y.due >= T0]; summ("Supply had not run out before April 1, 2024", y10, r[r.pid.isin(y10.pid)]); log("Clients whose supply ran out before April 1, 2024: %d, first interruptions among them: %d" % ((y.due < T0).sum(), y[y.due < T0].event.sum()))
@@ -271,7 +292,8 @@ heap = (wx.nextdate == wx.due).groupby(wx.fac).mean().sort_values(ascending=Fals
 log("Share of pickups on the exact day supply ran out, from January 24, 2025, by clinic (highest four removed in sensitivity analysis):", heap.round(3).values.tolist())
 y12 = y[~y.fac.isin(top)]; summ("Four clinics with the most pickups on the exact due day removed", y12, r[r.pid.isin(y12.pid)])
 S = pd.DataFrame(sens, columns=["Analysis", "Clients", "Interruptions", "12m %", "24m %", "aHR 1 earlier", "aHR 2 earlier", "aHR 3+ earlier", "aHR MSM", "aHR PWID male", "aHR PWID female", "aHR transgender", "Returned by 90d %"])
-S.loc[S.Analysis == "Follow-up ended 24 January 2025", "12m %"] = round(km_at(y4, "t", "event", [298])[0][0], 1)
+log("Follow-up ended 24 January 2025: risk at end of follow-up (298 days) %.1f%%" % km_at(y4, "t", "event", [298])[0][0])
+S.loc[S.Analysis == "Follow-up ended 24 January 2025", ["12m %", "24m %"]] = np.nan; S.loc[S.Analysis == "Follow-up started 1 July 2024", "24m %"] = np.nan
 S.to_excel(xw, "Sensitivity", index=False); log("\nSENSITIVITY\n" + S.to_string(index=False))
 # clients in care but not in the cohort
 nc = allincare[~allincare.pid.isin(y.pid)]; log("\nIn care on 1 April 2024 but not in cohort:", len(nc), nc.ver.fillna("not verified").value_counts().to_dict(), nc.kp.where(nc.kp.isin(KPS), "other or not recorded").value_counts().to_dict())
@@ -294,7 +316,7 @@ _, sE, _ = cox(ye, "t", "event", TERMS, REFS, label="first 91 days"); _, sL, _ =
 LM = pd.concat([sE, sL]); LM.to_excel(xw, "Landmark Cox", index=False)
 log("\nLANDMARK first 91 days: events %d\n%s" % (ye.event.sum(), sE.to_string(index=False))); log("\nLANDMARK after 91 days: n %d events %d\n%s" % (len(yl), yl.event.sum(), sL.to_string(index=False)))
 # discrimination without stratification
-def cidx(terms):
+def cidx(terms, y=y):
     X = pd.concat([pd.get_dummies(y[t].astype(str), prefix=t, drop_first=True).astype(float) for t in terms], axis=1); X["t"] = y.t.values; X["event"] = y.event.values
     return CoxPHFitter(penalizer=0.001).fit(X, "t", "event").concordance_index_
 log("\nConcordance, unstratified: facility only %.3f; client characteristics only %.3f; both %.3f" % (cidx(["fac"]), cidx(TERMS), cidx(TERMS + ["fac"])))
@@ -307,6 +329,24 @@ log("Between-facility variance of log-odds (12-month interruption): %.3f; median
 f2 = f12[f12["size"] >= 1000]; lo2 = np.log((f2["sum"] + 0.5) / (f2["size"] - f2["sum"] + 0.5)); s2 = 1 / (f2["sum"] + 0.5) + 1 / (f2["size"] - f2["sum"] + 0.5); w2_ = 1 / s2
 mu2 = (w2_ * lo2).sum() / w2_.sum(); Q2 = (w2_ * (lo2 - mu2) ** 2).sum(); t2_ = max(0, (Q2 - (len(lo2) - 1)) / (w2_.sum() - (w2_ ** 2).sum() / w2_.sum()))
 log("Without the clinic with 330 clients: median odds ratio %.2f (%d clinics)" % (np.exp(np.sqrt(2 * t2_) * 0.6745), len(f2)))
+def mor(yy, minsize=50):
+    yy = yy.assign(ev12=((yy.event == 1) & (yy.t <= 365)).astype(int)); f = yy.groupby("fac").ev12.agg(["sum", "size"]); f = f[f["size"] >= minsize]
+    l_ = np.log((f["sum"] + 0.5) / (f["size"] - f["sum"] + 0.5)); s_ = 1 / (f["sum"] + 0.5) + 1 / (f["size"] - f["sum"] + 0.5); w_ = 1 / s_
+    m_ = (w_ * l_).sum() / w_.sum(); Q_ = (w_ * (l_ - m_) ** 2).sum(); t_ = max(0, (Q_ - (len(l_) - 1)) / (w_.sum() - (w_ ** 2).sum() / w_.sum())); return np.exp(np.sqrt(2 * t_) * 0.6745)
+log("Cohort re-drawn on 1 July 2024: concordance clinic only %.3f; client characteristics only %.3f; both %.3f; median odds ratio %.2f; clinic 12-month risk range %.1f to %.1f" % (cidx(["fac"], y7), cidx(TERMS, y7), cidx(TERMS + ["fac"], y7), mor(y7), *(lambda z: (z.min(), z.max()))(y7.groupby("fac").apply(lambda g: km_at(g, "t", "event", [365])[0][0]))))
+Xu = pd.get_dummies(y.kpsex.astype(str), prefix="kpsex", prefix_sep="=").astype(float).drop(columns=["kpsex=FSW"]); Xu["t"] = y.t.values; Xu["event"] = y.event.values
+mu_ = CoxPHFitter().fit(Xu, "t", "event", robust=True).summary[["exp(coef)", "exp(coef) lower 95%", "exp(coef) upper 95%"]].round(3)
+log("Hazard ratios by group with no stratification by clinic and no other characteristic:\n" + mu_.to_string())
+top3 = fs.sort_values("km12", ascending=False).fac.head(3).tolist()
+log("Share of each group at the three clinics with the highest 12-month risk: " + str((100 * y.fac.isin(top3).groupby(y.kp).mean()).round(1).to_dict()))
+ivr = y[y.invdate >= T0]
+log("Records judged invalid during follow-up: exit or event recorded first: " + str(pd.crosstab(ivr.event, ivr.exit).to_dict()))
+log("Records judged invalid during follow-up: completed dispensing intervals before baseline, median %.0f (IQR %.0f to %.0f); years since first pickup at baseline, median %.1f" % (ivr.n_int.median(), ivr.n_int.quantile(.25), ivr.n_int.quantile(.75), ((T0 - ivr.firstpick).dt.days / 365.25).median()))
+for gname in ["No group on either line list", "Other group recorded", "both"]:
+    g_ = nk if gname == "both" else nk[nk.grp == gname]; ya, _ = outcomes(g_, v)
+    allr = pd.concat([y[["t", "event"]], ya[["t", "event"]]]); ka = km_at(allr, "t", "event", [365, 730])
+    log("Cohort plus excluded records (%s): n %d; 12-month risk %.1f%%; 24-month risk %.1f%%" % (gname, len(allr), ka[0][0], ka[1][0]))
+log("Records with a pickup before baseline that were not in care on 1 April 2024: %d of %d (%.1f%%)" % (flow[1][1] - flow[2][1], flow[1][1], 100 * (flow[1][1] - flow[2][1]) / flow[1][1]))
 log("12-month interruption, crude:", int(y.ev12.sum()), "of", N, "= %.1f%%" % (100 * y.ev12.mean()))
 # status and viral load at the end of follow-up
 log("\nStatus on 10 April 2026:", y.status.value_counts(dropna=False).to_dict())
@@ -328,9 +368,10 @@ log("  among clients with an interruption: result %d, below 1000: %.1f%%; withou
 w2 = v[v.pid.isin(y.pid) & v.nextdate.notna() & (v.due >= T0)].copy(); w2["late"] = (w2.nextdate - w2.due).dt.days
 w2["per"] = np.where(w2.due < "2024-07-01", "Apr-Jun 2024", np.where(w2.due < PAUSE, "Jul 2024-23 Jan 2025", "24 Jan 2025 onward"))
 tm = w2.groupby("per").late.agg(n="size", median="median", q10=lambda s: s.quantile(.1), q90=lambda s: s.quantile(.9), exact=lambda s: 100 * (s == 0).mean(), within7=lambda s: 100 * (s.abs() <= 7).mean())
-w2["fac"] = w2.pid.map(y.set_index("pid").fac); w["per3"] = np.where(w.due < "2024-07-01", "Apr-Jun 2024", np.where(w.due < PAUSE, "Jul 2024-23 Jan 2025", "24 Jan 2025 onward"))
-cl = w2.groupby(["fac", "per"]).late.agg(exact=lambda s: 100 * (s == 0).mean(), within7=lambda s: 100 * (s.abs() <= 7).mean()).join(w.groupby(["fac", "per3"]).missed.agg(intervals="size", missed=lambda s: 100 * s.mean()).rename_axis(["fac", "per"])).reset_index()
+w2["fac"] = w2.pid.map(y.set_index("pid").fac)
+cl = w2.groupby(["fac", "per"]).late.agg(exact=lambda s: 100 * (s == 0).mean(), within7=lambda s: 100 * (s.abs() <= 7).mean()).join(wf.groupby(["fac", "per3"]).missed.agg(intervals="size", missed=lambda s: 100 * s.mean()).rename_axis(["fac", "per"])).reset_index()
 cl.to_excel(xw, "Clinic by period", index=False)
+log("\nCLINIC BY PERIOD (percent of intervals missed; percent of pickups on the exact day)\n" + cl.round(1).to_string(index=False))
 tm.to_excel(xw, "Pickup timing"); log("\nPICKUP TIMING (days after supply ran out)\n" + tm.round(1).to_string())
 ms = pd.crosstab(y.kp, y.refgrp, normalize="index").mul(100).round(1); log("\nSupply length by group (%)\n" + ms.to_string())
 xw.close()
@@ -352,9 +393,9 @@ ax[1].axvline(T0, color="#252525", ls=":", lw=1.2); ax[1].text(T0, ax[1].get_yli
 ax[1].axvline(PAUSE, color="#d7301f", ls="--", lw=1.2); ax[1].text(PAUSE, ax[1].get_ylim()[1] * 0.99, " Stop-work\n order", color="#d7301f", fontsize=8, va="top")
 ax[1].set(xlabel="Month the dispensed supply ran out", ylabel="Intervals with no pickup within 28 days (%)"); ax[1].set_ylim(bottom=0); ax[1].tick_params(axis="x", rotation=45); ax[1].legend(frameon=False, fontsize=8, loc="center right")
 for kpn in KPS:
-    g = r[r.kp == kpn]; k = KaplanMeierFitter().fit(g.rt, g.ret)
-    ax[2].step(k.survival_function_.index, 100 * (1 - k.survival_function_.iloc[:, 0]), where="post", color=KC[kpn], ls=LS[kpn], lw=2, label=f"{KL[kpn]} (n={len(g):,})")
-ax[2].set(xlabel="Days since interruption", ylabel="Clients back on treatment (%)", xlim=(0, 180), ylim=(0, 102)); ax[2].legend(frameon=False, fontsize=8, loc="lower right")
+    g = r[r.kp == kpn]; np.random.seed(1); k = AalenJohansenFitter(calculate_variance=False).fit(g.rt, g.rcode, event_of_interest=1)
+    ax[2].step(k.cumulative_density_.index, 100 * k.cumulative_density_.iloc[:, 0], where="post", color=KC[kpn], ls=LS[kpn], lw=2, label=f"{KL[kpn]} (n={len(g):,})")
+ax[2].set(xlabel="Days since the date of interruption", ylabel="Clients back on treatment (%)", xlim=(0, 180), ylim=(0, 102)); ax[2].legend(frameon=False, fontsize=8, loc="lower right")
 for a_, t in zip(ax, "abc"):
     a_.spines[["top", "right"]].set_visible(False); a_.text(-0.12, 1.04, t, transform=a_.transAxes, fontsize=14, fontweight="bold")
 plt.tight_layout(); fig.savefig(os.path.join(OUT, "Fig1.png")); fig.savefig(os.path.join(OUT, "Fig1.tif"), pil_kwargs={"compression": "tiff_lzw"})
